@@ -2,47 +2,57 @@ from flask import Flask, request, jsonify
 from flask_cors import CORS
 import cv2
 import numpy as np
-import joblib
-from lstm_realtime import load_model, preprocess_frame
+from pose_processor import PoseProcessor
+import tensorflow as tf
+import h5py
+import json
 
 app = Flask(__name__)
-CORS(app)  # Enable CORS for cross-origin requests
+CORS(app)
 
-# Load model during startup
-model = None
-def initialize_model():
-    global model
-    model = load_model()  # Implement this in lstm_realtime.py
-    print("Model loaded successfully")
+# Load LSTM Model
+def load_lstm_model():
+    custom_objects = {
+        'Orthogonal': tf.keras.initializers.Orthogonal,
+        'Sequential': tf.keras.models.Sequential
+    }
 
-initialize_model()
+    with h5py.File("lstm-trained.h5", 'r') as f:
+        model_config = json.loads(f.attrs['model_config'])
+        model = tf.keras.models.model_from_json(json.dumps(model_config), custom_objects=custom_objects)
+        
+        for layer in model.layers:
+            if layer.name in f['model_weights']:
+                layer.set_weights([f['model_weights'][layer.name][name] 
+                                 for name in f['model_weights'][layer.name].attrs['weight_names']])
+    return model
+
+model = load_lstm_model()
+pose_processor = PoseProcessor()
+frame_buffer = []
 
 @app.route('/predict', methods=['POST'])
 def predict():
-    """Endpoint for violence prediction"""
-    try:
-        # Get frame from request
-        if 'frame' not in request.files:
-            return jsonify({'error': 'No frame provided'}), 400
-            
-        frame_file = request.files['frame']
-        frame = cv2.imdecode(np.frombuffer(frame_file.read(), np.uint8), cv2.IMREAD_COLOR)
-        
-        # Preprocess frame for LSTM model
-        processed_frame = preprocess_frame(frame)
-        
-        # Make prediction (adapt for your LSTM's sequence requirements)
-        prediction = model.predict(np.expand_dims(processed_frame, axis=0))
-        
-        # Return confidence score
+    if 'frame' not in request.files:
+        return jsonify({'error': 'No frame provided'}), 400
+    
+    frame = cv2.imdecode(np.frombuffer(request.files['frame'].read(), np.uint8), cv2.IMREAD_COLOR)
+    landmarks = pose_processor.process_frame(frame)
+    
+    if landmarks is None:
+        return jsonify({'prediction': 'neutral', 'confidence': 0.0})
+    
+    frame_buffer.append(landmarks)
+    
+    if len(frame_buffer) == 20:
+        prediction = model.predict(np.expand_dims(frame_buffer, axis=0))[0][0]
+        frame_buffer.clear()
         return jsonify({
-            'violence': float(prediction[0][0]),
-            'message': 'Success'
+            'prediction': 'violent' if prediction > 0.5 else 'neutral',
+            'confidence': float(prediction)
         })
-
-    except Exception as e:
-        print(f"Prediction error: {str(e)}")
-        return jsonify({'error': str(e)}), 500
+    
+    return jsonify({'status': 'collecting', 'count': len(frame_buffer)})
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5000, threaded=True)
+    app.run(host='0.0.0.0', port=5000)
